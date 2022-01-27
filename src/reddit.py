@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 import pickle
@@ -5,7 +6,7 @@ import sys
 import os
 import tqdm
 import requests
-import praw
+import asyncpraw
 import pandas as pd
 from qas import (
     a_cols,
@@ -18,6 +19,11 @@ from qas import (
     write_aueb_pickle,
     normalize_pmid,
 )
+import aiohttp
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 request_query = True  # set to True to call SE API, False uses cached pickle
 with open("params.json", "r") as f:
@@ -48,7 +54,6 @@ def process_comment(comment, submission):
             "q_body": submission.selftext,
             "a_body": a_text,
         }
-        
 
         # print(all_links)
         # else:
@@ -72,11 +77,13 @@ def process_comment(comment, submission):
     return pubmed_qa_object, a_object
 
 
-def get_reddit_questions_pushshift(sitename, min_answer_count=1, min_q_score=1):
+async def get_reddit_questions_pushshift(sitename, min_answer_count=1, min_q_score=1):
     page_size = 1000
     base_url = "https://api.pushshift.io/reddit/search/submission/?size={}&sort_type=created_utc&subreddit={}"
     base_url = base_url.format(str(page_size), sitename)
-    reddit = praw.Reddit(params["toolname"])
+    session = aiohttp.ClientSession()
+
+    reddit = asyncpraw.Reddit(params["toolname"])
 
     pubmed_url_string = "https://www.ncbi.nlm.nih.gov/p"
     pubmed_qa = []
@@ -88,70 +95,71 @@ def get_reddit_questions_pushshift(sitename, min_answer_count=1, min_q_score=1):
     last_date = 0
     total_retrieved = 0
     iteration = 1
+
     while total_retrieved < 50000:
         if total_retrieved > 0:
             url = base_url + "&before={}".format(str(last_date))
         else:
             url = base_url
         print(iteration, url)
-        result = requests.get(url)
-        reddit_posts = result.json()
-        if len(reddit_posts["data"]) == 0:
-            break
-        #last_score = reddit_posts["data"][-1]["score"]
 
-        last_date = reddit_posts["data"][-1]["created_utc"]
-        total_retrieved += len(reddit_posts["data"])
-        print(
-            reddit_posts["data"][0]["title"],
-            last_date,
-            total_retrieved,
-            len(question_items),
-        )
+        async with session.get(url) as resp:
+            reddit_posts = await resp.json()
+            if len(reddit_posts["data"]) == 0:
+                break
+            #last_score = reddit_posts["data"][-1]["score"]
 
-        for post in reddit_posts["data"]:
-            new_question = {
-                "score": post["score"],
-                "question_id": post["id"],
-                "body": post.get("selftext", ""),
-                "title": post["title"],
-            }
+            last_date = reddit_posts["data"][-1]["created_utc"]
+            total_retrieved += len(reddit_posts["data"])
+            print(
+                reddit_posts["data"][0]["title"],
+                last_date,
+                total_retrieved,
+                len(question_items),
+            )
 
-            if "?" in new_question["title"] or "?" in new_question["body"]:
-                # retrieve submission using PRAW to get answers
-                submission = reddit.submission(id=new_question["question_id"])
-                
-                q_a[submission.id] = []
-                q_table = q_table.append(
-                    {
-                        "qid": submission.id,
-                        "score": submission.score,
-                        "q_title": submission.title,
-                        "q_body": submission.selftext.replace("<img", "<a").replace(
-                            "<hr>", ""
-                        ),
-                    },
-                    ignore_index=True,
-                )
+            for post in reddit_posts["data"]:
+                new_question = {
+                    "score": post["score"],
+                    "question_id": post["id"],
+                    "body": post.get("selftext", ""),
+                    "title": post["title"],
+                }
 
-                # get answers
+                if "?" in new_question["title"] or "?" in new_question["body"]:
+                    # retrieve submission using PRAW to get answers
+                    submission = await reddit.submission(id=new_question["question_id"])
 
-                # print(submission.num_comments)
-                submission.comments.replace_more(limit=0)
-                for comment in submission.comments:
+                    q_a[submission.id] = []
+                    q_table = q_table.append(
+                        {
+                            "qid": submission.id,
+                            "score": submission.score,
+                            "q_title": submission.title,
+                            "q_body": submission.selftext.replace("<img", "<a").replace(
+                                "<hr>", ""
+                            ),
+                        },
+                        ignore_index=True,
+                    )
 
-                    pubmed_qa_object, a_object = process_comment(comment, submission)
+                    # get answers
 
-                    if pubmed_qa_object is not None:
-                        pubmed_qa.append(pubmed_qa_object)
-                        a_table = a_table.append(a_object, ignore_index=True)
-                        q_a[submission.id].append(comment.id)
-                question_items.append(new_question)
-        iteration += 1
+                    # print(submission.num_comments)
+                    await submission.comments.replace_more(limit=0)
+                    async for comment in submission.comments:
+                        pubmed_qa_object, a_object = process_comment(comment, submission)
+
+                        if pubmed_qa_object is not None:
+                            pubmed_qa.append(pubmed_qa_object)
+                            a_table = a_table.append(a_object, ignore_index=True)
+                            q_a[submission.id].append(comment.id)
+                    question_items.append(new_question)
+            iteration += 1
     return q_table, a_table, q_a
 
 
-def get_reddit_questions(sitename, min_answer_count=1, min_q_score=1):
+async def get_reddit_questions(sitename, min_answer_count=1, min_q_score=1):
     """Use reddit API to retrieve questions
 
     Can request from scratch (request_query=True) or return a previously cached request.
@@ -166,13 +174,14 @@ def get_reddit_questions(sitename, min_answer_count=1, min_q_score=1):
     :rtype: list 
 
     """
-    reddit = praw.Reddit(params["toolname"])
+    reddit = asyncpraw.Reddit(params["toolname"])
     pubmed_url_string = "https://www.ncbi.nlm.nih.gov/p"
     pubmed_qa = []
     q_table = pd.DataFrame(columns=q_cols)
     a_table = pd.DataFrame(columns=a_cols)
     q_a = {}
-    for submission in tqdm.tqdm(reddit.subreddit(sitename).top(limit=10000)):
+    submissions = await reddit.subreddit.top(limit=10000)
+    for submission in tqdm.tqdm(submissions):
         if submission.num_comments < min_answer_count:
             continue
         if submission.score < min_q_score:
@@ -270,7 +279,7 @@ def main():
     # q_items = retrieve_questions(sitename)
     if request_query:
         # q_table, a_table, q_a = get_reddit_questions(sitename)
-        q_table, a_table, q_a = get_reddit_questions_pushshift(sitename)
+        q_table, a_table, q_a = asyncio.run(get_reddit_questions_pushshift(sitename))
         sitename = "reddit/{}/{}".format(sitename, params["version"])
         with open("{}_qtable.pkl".format(sitename), "wb") as f:
             pickle.dump(q_table, f)

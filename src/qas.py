@@ -13,7 +13,7 @@ import spacy
 import numpy as np
 
 # Load English tokenizer, tagger, parser, NER and word vectors
-nlp = spacy.load("en_vectors_web_lg")
+nlp = spacy.load("en_core_web_lg")
 
 """
 Helper functions for QA post retrieval and processing.
