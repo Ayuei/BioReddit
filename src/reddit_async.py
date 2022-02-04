@@ -1,4 +1,3 @@
-import asyncio
 import re
 import json
 import pandas as pd
@@ -8,10 +7,23 @@ import os
 import sys
 import warnings
 import pmaw
+import argparse
+from loguru import logger
+
 
 from typing import List
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+logger.add("scrapper.log", rotation="500 MB")
+
+parser = argparse.ArgumentParser(description="A reddit subreddit scrapper")
+parser.add_argument("subreddits", type=str, nargs="+", help='Subreddits to scrape')
+parser.add_argument("--load_submissions", action='store_true', help='Whether to load submissions from CSV if it exists')
+parser.add_argument("--skip", action='store_true', help='Skip subreddits that are ' +
+                                                        'already scrapped (may not be up to date)')
+parser.add_argument("--test", action='store_true', help='Sets the limit to 10 for testing')
+args = parser.parse_args()
+
 
 
 class RedditParams:
@@ -40,6 +52,7 @@ class CommentProcessor:
 
 
 def to_csv(data, fp):
+    logger.info(f"Writing data to {fp}")
     df = pd.DataFrame(data)
     df.to_csv(fp, header=True, index=False, columns=list(df.axes[1]))
 
@@ -52,7 +65,8 @@ class RedditRetriever:
         self.pmaw = pmaw.PushshiftAPI(praw=praw_api)
 
     def get_submissions(self, subreddit, limit=None):
-        submissions = self.pmaw.search_submissions(subreddit=subreddit, limit=limit, mem_safe=True)
+        submissions = self.pmaw.search_submissions(subreddit=subreddit, limit=limit,
+                                                   mem_safe=True)
 
         return submissions
 
@@ -64,13 +78,33 @@ class RedditRetriever:
         return comments
 
 
+@logger.catch
 def main():
     rt = RedditRetriever()
+    limit = None
 
-    submission = rt.get_submissions('askdocs', limit=None)
-    sub_ids = list(to_csv(submission, "asdocs_submissions.csv").loc[:, 'id'])
-    comments = rt.get_comments_from_submissions(sub_ids)
-    to_csv(comments, "asdocs_comments.csv")
+    if args.test:
+        limit = 10
+
+    for subreddit in args.subreddits:
+        logger.info(f"Scrapping {subreddit}")
+        if args.load_submissions and os.path.isfile(f'{subreddit}_submissions.csv'):
+            logger.info(f"Loading {subreddit} submissions from CSV")
+            sub_ids = list(pd.read_csv(f'{subreddit}_submissions.csv', header=0).loc[:, 'id'])
+            if limit:
+                sub_ids = sub_ids[:limit]
+        else:
+            logger.info(f"Getting {subreddit} submissions from API")
+            submission = rt.get_submissions(subreddit, limit=limit)
+            sub_ids = list(to_csv(submission, f'{subreddit}_submissions.csv').loc[:, 'id'])
+
+        if args.skip and os.path.exists(f"{subreddit}_comments.csv"):
+            logger.info(f"Skipping {subreddit} comment retrieval...")
+            continue
+
+        logger.info(f"Getting {subreddit} comments")
+        comments = rt.get_comments_from_submissions(sub_ids)
+        to_csv(comments, f"{subreddit}_comments.csv")
 
 
 if __name__ == "__main__":
